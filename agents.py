@@ -141,9 +141,30 @@ Rules:
 
 class PDFParserAgent:
     def __init__(self):
-        self.api_key = get_secret("GEMINI_API_KEY")
-        primary = get_secret("GEMINI_MODEL", "gemini-2.5-flash")
-        self.models = list(dict.fromkeys([primary, "gemini-2.5-flash-lite", "gemini-2.0-flash"]))
+        self.api_key = get_secret("GEMINI_API_KEY") or get_secret("GOOGLE_API_KEY")
+        self.preferred = get_secret("GEMINI_MODEL")  # opsiyonel; bos birakirsaniz otomatik secilir
+        self.last_model = None
+
+    def _candidate_models(self, client) -> list[str]:
+        """Google'in o an sundugu Flash modellerini listeler (en yeni -> eski). Model adlari sik degistigi icin sabit yazilmaz."""
+        found = []
+        listed = False
+        try:
+            for m in client.models.list():
+                listed = True
+                n = (m.name or "").replace("models/", "")
+                acts = getattr(m, "supported_actions", None) or ["generateContent"]
+                mm = re.fullmatch(r"gemini-(\d+(?:\.\d+)?)-flash(-lite)?(-preview[\w\-]*)?", n)
+                if mm and "generateContent" in acts:
+                    found.append((-float(mm.group(1)), 1 if mm.group(2) else 0, 1 if mm.group(3) else 0, n))
+        except Exception as e:
+            log.warning("Model listesi alinamadi: %s", e)
+        names = [t[3] for t in sorted(found)]
+        order = []
+        if self.preferred and (not listed or self.preferred in names):
+            order.append(self.preferred)
+        order += names or ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
+        return list(dict.fromkeys(order))[:4]
 
     # ---------- yardimcilar ----------
     @staticmethod
@@ -193,13 +214,14 @@ class PDFParserAgent:
                  or [types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")])
         prompt = _PROMPT + (f"\nText-layer hint:\n{text[:6000]}" if text else "")
         errors = []
-        for model in self.models:
+        for model in self._candidate_models(client):
             for attempt in range(2):
                 try:
                     resp = client.models.generate_content(
                         model=model, contents=parts + [prompt],
                         config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0))
                     raw = re.sub(r"^```(?:json)?|```$", "", (resp.text or "").strip(), flags=re.M).strip()
+                    self.last_model = model
                     return json.loads(raw)
                 except Exception as e:
                     msg = str(e)
