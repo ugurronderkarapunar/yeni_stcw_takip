@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import smtplib
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -73,8 +74,14 @@ def normalize_date(raw) -> Optional[date]:
 
 
 # ----------------------------------------------------------------------------
-# AJAN 1: PDF PARSER
+# AJAN 1: PDF PARSER  (metin katmani -> regex | taranmis/coklu belge -> Gemini Vision)
 # ----------------------------------------------------------------------------
+
+
+def tr_upper(s: str) -> str:
+    return re.sub(r"\s+", " ", s.replace("i", "İ").replace("ı", "I").upper()).strip()
+
+
 @dataclass
 class ParsedCertificate:
     seafarer_name: str = "UNKNOWN"
@@ -84,8 +91,10 @@ class ParsedCertificate:
     expiry_date: Optional[date] = None
     needs_review: bool = False
     warnings: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
     source_file: str = ""
     method: str = "regex"
+    doc_type: str = ""
 
 
 _DATE = (r"(\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}|\d{4}[./\-]\d{1,2}[./\-]\d{1,2}"
@@ -104,26 +113,66 @@ _RE = {
                        r"|security\s+awareness|ECDIS|GMDSS|ARPA|BRM|ERM)\b.*)$"),
 }
 
-_PROMPT = """You are a maritime STCW certificate analyst. Extract fields from the certificate.
-Return ONLY a JSON object with keys: seafarer_name, certificate_name, certificate_no, issue_date, expiry_date.
-Dates must be ISO YYYY-MM-DD (convert any format such as '15 OCT 2026', '15.10.2026', '2026/10/15').
-Use null for any value that is not present. Do not invent values."""
+_PROMPT = """You are an expert reader of Turkish seafarer documents and STCW certificates.
+The images are scanned pages (possibly rotated, tilted, bilingual Turkish/English, with stamps and signatures).
+A page may contain ONE document or MANY (e.g. a table of 'Other Certificates of Proficiency' where every row is a
+separate certificate with its own issue/expiry dates and its own certificate number, usually in parentheses).
+
+Return ONLY JSON: {"documents":[{"document_type","seafarer_name","certificate_name","certificate_no","issue_date","expiry_date"}]}
+
+Rules:
+- One object per certificate/document. Pages with no certificate data (explanation/description pages, blank pages) -> {"documents":[]}.
+- document_type: SEAFARER_ID | COMPETENCY | MEDICAL | TRAINING | OTHER.
+- seafarer_name: given names then surname, e.g. "NAME SURNAME" (use the holder's name printed on the page; ignore MRZ lines).
+- certificate_name: prefer the English title; keep the Turkish title in parentheses if short.
+  Seafarer ID book -> "Seafarer's Identity Document". Certificate of competency -> include the capacity, e.g. "Certificate of Competency - Chief Engineer".
+  Medical -> "Seafarer Medical Certificate".
+- certificate_no by type: ID book = document number at top right; competency = 'Yeterlik Belgesi No / Certificate No';
+  medical = 'Belge no / Certificate no'; training table = the code in parentheses after the title. Copy character by character.
+- issue_date by type: ID = 'Veriliş Tarihi / Date of issue'; competency = 'Düzenleme tarihi / Issued on';
+  medical = 'Muayene tarihi / Date of examination'; training table = first date in the left column.
+- expiry_date by type: ID = 'Bitiş Tarihi / Date of expiry'; competency = the date in the sentence 'until / tarihine kadar' near the top;
+  medical = 'Belgenin geçerliliğinin bitiş tarihi / Expiry date'; training table = second date in the left column.
+  If a row shows only ONE date, that is the issue date and expiry_date is null (certificate does not expire).
+- NEVER use the date of birth ('Doğum tarihi / Date of birth') as an issue or expiry date.
+- Dates as ISO YYYY-MM-DD (Turkish dates are DD.MM.YYYY). If a value is not clearly legible use null. Never guess or invent.
+"""
 
 
 class PDFParserAgent:
     def __init__(self):
         self.api_key = get_secret("GEMINI_API_KEY")
-        self.model = get_secret("GEMINI_MODEL", "gemini-2.5-flash")
+        primary = get_secret("GEMINI_MODEL", "gemini-2.5-flash")
+        self.models = list(dict.fromkeys([primary, "gemini-2.5-flash-lite", "gemini-2.0-flash"]))
 
+    # ---------- yardimcilar ----------
     @staticmethod
     def extract_text(pdf_bytes: bytes) -> str:
         try:
             import pdfplumber
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 return "\n".join((p.extract_text() or "") for p in pdf.pages[:5]).strip()
-        except Exception as e:  # bozuk/sifreli PDF: hata firlatma
+        except Exception as e:
             log.warning("pdfplumber hatasi: %s", e)
             return ""
+
+    @staticmethod
+    def _render_pages(pdf_bytes: bytes, max_pages: int = 4) -> list[bytes]:
+        """Taranmis PDF'i kucuk JPEG'lere cevirir (2-3 MB PDF -> ~300 KB gorsel)."""
+        try:
+            import pdfplumber
+            out = []
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for pg in pdf.pages[:max_pages]:
+                    im = pg.to_image(resolution=150).original.convert("RGB")
+                    im.thumbnail((1800, 1800))
+                    buf = io.BytesIO()
+                    im.save(buf, "JPEG", quality=85)
+                    out.append(buf.getvalue())
+            return out
+        except Exception as e:
+            log.warning("Sayfa render hatasi: %s", e)
+            return []
 
     @staticmethod
     def _regex_extract(text: str) -> dict:
@@ -136,62 +185,81 @@ class PDFParserAgent:
             out[field_name] = m.group(1).strip()[:150] if m else None
         return out
 
-    def _gemini_extract(self, text: str, pdf_bytes: bytes) -> dict:
+    def _gemini_extract(self, text: str, images: list[bytes], pdf_bytes: bytes):
         from google import genai
         from google.genai import types
         client = genai.Client(api_key=self.api_key)
-        if len(text) >= 80:
-            contents = [_PROMPT + "\n\nDOCUMENT TEXT:\n" + text[:12000]]
-        else:  # taranmis PDF: Gemini'ye dogrudan PDF gonder (OCR yerine)
-            contents = [types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), _PROMPT]
-        resp = client.models.generate_content(
-            model=self.model, contents=contents,
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0),
-        )
-        data = json.loads(resp.text)
-        if isinstance(data, list):
-            data = data[0] if data else {}
-        return {
-            "seafarer_name": data.get("seafarer_name"), "certificate_name": data.get("certificate_name"),
-            "certificate_no": data.get("certificate_no"),
-            "issue_date": normalize_date(data.get("issue_date")), "expiry_date": normalize_date(data.get("expiry_date")),
-        }
-
-    def parse(self, pdf_bytes: bytes, filename: str = "") -> ParsedCertificate:
-        """Asla exception firlatmaz; eksik alanlar icin varsayilan + needs_review dondurur."""
-        res = ParsedCertificate(source_file=filename)
-        text = self.extract_text(pdf_bytes)
-        data = self._regex_extract(text) if text else {}
-        critical = ("seafarer_name", "certificate_name", "certificate_no", "expiry_date")
-
-        if any(not data.get(k) for k in critical):
-            if self.api_key:
+        parts = ([types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in images]
+                 or [types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")])
+        prompt = _PROMPT + (f"\nText-layer hint:\n{text[:6000]}" if text else "")
+        errors = []
+        for model in self.models:
+            for attempt in range(2):
                 try:
-                    llm = self._gemini_extract(text, pdf_bytes)
-                    for k, v in llm.items():
-                        if v and not data.get(k):
-                            data[k] = v
-                    res.method = "regex+gemini" if text else "gemini-vision"
+                    resp = client.models.generate_content(
+                        model=model, contents=parts + [prompt],
+                        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0))
+                    raw = re.sub(r"^```(?:json)?|```$", "", (resp.text or "").strip(), flags=re.M).strip()
+                    return json.loads(raw)
                 except Exception as e:
-                    res.warnings.append(f"Gemini fallback basarisiz: {e}")
-            else:
-                res.warnings.append("GEMINI_API_KEY yok; LLM fallback atlandi.")
-        if not text:
-            res.warnings.append("PDF taranmis/gorsel gorunuyor; metin katmani yok.")
+                    msg = str(e)
+                    errors.append(f"{model}: {msg[:160]}")
+                    if attempt == 0 and any(c in msg for c in ("429", "500", "503", "UNAVAILABLE", "RESOURCE_EXHAUSTED")):
+                        time.sleep(5)
+                        continue
+                    break
+        raise RuntimeError(" | ".join(errors[-3:]))
 
-        stem = re.sub(r"\.pdf$", "", filename, flags=re.I) or "certificate"
-        res.seafarer_name = data.get("seafarer_name") or "UNKNOWN"
-        res.certificate_name = data.get("certificate_name") or stem.replace("_", " ")[:150]
-        res.certificate_no = data.get("certificate_no") or "UNKNOWN-" + hashlib.md5(pdf_bytes).hexdigest()[:8].upper()
-        res.issue_date, res.expiry_date = data.get("issue_date"), data.get("expiry_date")
+    def _build(self, d: dict, filename: str, pdf_bytes: bytes, idx: int, method: str) -> ParsedCertificate:
+        r = ParsedCertificate(source_file=filename, method=method, doc_type=str(d.get("document_type") or ""))
+        stem = re.sub(r"\.pdf$", "", filename, flags=re.I).replace("_", " ") or "certificate"
+        r.seafarer_name = tr_upper(d["seafarer_name"]) if d.get("seafarer_name") else "UNKNOWN"
+        r.certificate_name = str(d.get("certificate_name") or stem)[:200]
+        r.certificate_no = (re.sub(r"\s+", "", str(d["certificate_no"])) if d.get("certificate_no")
+                            else f"UNKNOWN-{hashlib.md5(pdf_bytes).hexdigest()[:6].upper()}-{idx + 1}")
+        r.issue_date, r.expiry_date = normalize_date(d.get("issue_date")), normalize_date(d.get("expiry_date"))
 
-        missing = [k for k in critical if not data.get(k)]
+        missing = [lbl for lbl, ok in (("personel adı", d.get("seafarer_name")), ("belge adı", d.get("certificate_name")),
+                                       ("belge no", d.get("certificate_no")), ("veriliş tarihi", r.issue_date)) if not ok]
         if missing:
-            res.warnings.append("Eksik alanlar (varsayilan atandi): " + ", ".join(missing))
-        if res.issue_date and res.expiry_date and res.expiry_date < res.issue_date:
-            res.warnings.append("Bitis tarihi veris tarihinden once; lutfen kontrol edin.")
-        res.needs_review = bool(res.warnings)
-        return res
+            r.warnings.append("Eksik/okunamayan: " + ", ".join(missing))
+        if not r.expiry_date:
+            r.notes.append("Bitiş tarihi yok → süresiz kabul edildi (gerekiyorsa elle girin)")
+        if r.issue_date and r.expiry_date and r.expiry_date < r.issue_date:
+            r.warnings.append("Bitiş tarihi veriliş tarihinden önce")
+        r.needs_review = bool(r.warnings)
+        return r
+
+    # ---------- ana akis ----------
+    def parse(self, pdf_bytes: bytes, filename: str = "") -> list[ParsedCertificate]:
+        """Asla exception firlatmaz. Bir dosyadan 0..N belge dondurur (0 = belge verisi yok)."""
+        critical = ("seafarer_name", "certificate_name", "certificate_no", "expiry_date")
+        text = self.extract_text(pdf_bytes)
+        regex_data = self._regex_extract(text) if len(text) >= 80 else {}
+        if regex_data and all(regex_data.get(k) for k in critical):
+            return [self._build(regex_data, filename, pdf_bytes, 0, "regex")]
+
+        if not self.api_key:
+            r = self._build(regex_data, filename, pdf_bytes, 0, "none")
+            r.warnings.insert(0, "Taranmış PDF için GEMINI_API_KEY gerekli (.env dosyasını kontrol edin).")
+            r.needs_review = True
+            return [r]
+        try:
+            data = self._gemini_extract(text, self._render_pages(pdf_bytes), pdf_bytes)
+        except Exception as e:
+            r = self._build(regex_data, filename, pdf_bytes, 0, "gemini-error")
+            r.warnings.insert(0, f"Gemini çağrısı başarısız: {e}")
+            r.needs_review = True
+            return [r]
+
+        docs = data.get("documents", []) if isinstance(data, dict) else data
+        docs = [x for x in (docs or []) if isinstance(x, dict) and (x.get("certificate_name") or x.get("certificate_no"))]
+        names = [tr_upper(x["seafarer_name"]) for x in docs if x.get("seafarer_name")]
+        common = max(set(names), key=names.count) if names else None
+        for x in docs:  # ayni sayfadaki belgelerde bos kalan ismi tamamla
+            if not x.get("seafarer_name") and common:
+                x["seafarer_name"] = common
+        return [self._build(x, filename, pdf_bytes, i, "gemini-vision") for i, x in enumerate(docs)]
 
 
 # ----------------------------------------------------------------------------
