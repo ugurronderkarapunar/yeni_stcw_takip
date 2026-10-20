@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
@@ -43,43 +43,57 @@ st.title("⚓ STCW Sertifika Takip Paneli")
 tab_up, tab_tbl, tab_notif = st.tabs(["📄 PDF Yükle & Ayrıştır", "📋 Takip Tablosu", "🔔 Bildirimler"])
 
 # ============================ TAB 1 ============================
-with tab_up:
-    files = st.file_uploader("STCW PDF belgeleri", type=["pdf"], accept_multiple_files=True)
-    if files and st.button("🤖 PDF Parser Ajanını Çalıştır", type="primary"):
-        parser, out = PDFParserAgent(), []
-        with st.spinner("Belgeler analiz ediliyor..."):
-            for f in files:
-                out.append({"parsed": parser.parse(f.getvalue(), f.name), "saved": False})
-        st.session_state["parsed"] = out
+def _d(v):
+    """data_editor degerini (NaT/Timestamp/date) guvenle date'e cevirir."""
+    if v is None or pd.isna(v):
+        return None
+    return v.date() if isinstance(v, datetime) else v
 
-    for i, item in enumerate(st.session_state.get("parsed", [])):
-        p = item["parsed"]
-        icon = "✅" if item["saved"] else ("⚠️" if p.needs_review else "🟢")
-        with st.expander(f"{icon} {p.source_file}  ·  yöntem: {p.method}", expanded=not item["saved"]):
-            if item["saved"]:
-                st.success("Kaydedildi.")
-                continue
-            for w in p.warnings:
-                st.warning(w)
-            with st.form(f"form_{i}"):
-                c1, c2, c3 = st.columns(3)
-                name = c1.text_input("Personel Adı", p.seafarer_name)
-                cname = c2.text_input("Belge Adı", p.certificate_name)
-                cno = c3.text_input("Belge No", p.certificate_no)
-                d1, d2 = st.columns(2)
-                issue = d1.date_input("Veriliş Tarihi", p.issue_date, min_value=MIN_D, max_value=MAX_D, format="DD/MM/YYYY")
-                expiry = d2.date_input("Bitiş Tarihi", p.expiry_date, min_value=MIN_D, max_value=MAX_D, format="DD/MM/YYYY")
-                e1, e2 = st.columns(2)
-                email = e1.text_input("Bildirim E-postası (opsiyonel)")
-                phone = e2.text_input("WhatsApp No (905xxxxxxxxx, opsiyonel)")
-                if st.form_submit_button("✅ Onayla ve Kaydet"):
-                    with session_scope() as s:
-                        compliance.upsert(s, seafarer_name=name.strip(), certificate_name=cname.strip(),
-                                          certificate_no=cno.strip(), issue_date=issue, expiry_date=expiry,
-                                          needs_review=False, source_file=p.source_file,
+
+with tab_up:
+    files = st.file_uploader("STCW PDF belgeleri (taranmış olabilir, bir dosyada birden çok belge olabilir)",
+                             type=["pdf"], accept_multiple_files=True)
+    if files and st.button("🤖 PDF Parser Ajanını Çalıştır", type="primary"):
+        parser, found, empty = PDFParserAgent(), [], []
+        with st.spinner("Belgeler analiz ediliyor (taranmış PDF'lerde 10-30 sn sürebilir)..."):
+            for f in files:
+                res = parser.parse(f.getvalue(), f.name)
+                (found.extend(res) if res else empty.append(f.name))
+        st.session_state["parsed"], st.session_state["empty"] = found, empty
+
+    for name in st.session_state.get("empty", []):
+        st.info(f"ℹ️ **{name}**: sertifika verisi bulunamadı (açıklama/boş sayfa olabilir), atlandı.")
+
+    parsed = st.session_state.get("parsed", [])
+    if parsed:
+        st.caption("Tabloyu doğrudan düzenleyebilirsiniz. Kaydetmek istemediklerinizin ✔ işaretini kaldırın.")
+        df = pd.DataFrame([{
+            "Kaydet": True, "Personel": p.seafarer_name, "Belge": p.certificate_name, "Belge No": p.certificate_no,
+            "Veriliş": p.issue_date, "Bitiş": p.expiry_date, "Kaynak": p.source_file,
+            "Uyarı": " | ".join(p.warnings + p.notes)} for p in parsed])
+        edited = st.data_editor(
+            df, hide_index=True, use_container_width=True, key="parsed_editor",
+            disabled=["Kaynak", "Uyarı"],
+            column_config={
+                "Kaydet": st.column_config.CheckboxColumn(width="small"),
+                "Veriliş": st.column_config.DateColumn(format="DD.MM.YYYY", min_value=MIN_D, max_value=MAX_D),
+                "Bitiş": st.column_config.DateColumn(format="DD.MM.YYYY", min_value=MIN_D, max_value=MAX_D),
+            })
+        e1, e2 = st.columns(2)
+        email = e1.text_input("Bildirim E-postası (opsiyonel, hepsine uygulanır)")
+        phone = e2.text_input("WhatsApp No (905xxxxxxxxx, opsiyonel)")
+        if st.button("✅ Seçilenleri Kaydet", type="primary"):
+            saved = 0
+            with session_scope() as s:
+                for i, r in edited.iterrows():
+                    if r["Kaydet"]:
+                        compliance.upsert(s, seafarer_name=str(r["Personel"]).strip(), certificate_name=str(r["Belge"]).strip(),
+                                          certificate_no=str(r["Belge No"]).strip(), issue_date=_d(r["Veriliş"]),
+                                          expiry_date=_d(r["Bitiş"]), needs_review=False, source_file=r["Kaynak"],
                                           notify_email=email.strip() or None, notify_phone=phone.strip() or None)
-                    item["saved"] = True
-                    st.rerun()
+                        saved += 1
+            st.session_state["parsed"] = []
+            st.success(f"{saved} belge kaydedildi. 'Takip Tablosu' sekmesine bakın.")
 
 # ============================ TAB 2 ============================
 with tab_tbl:
