@@ -35,6 +35,12 @@ except Exception as e:
     st.error(f"Veritabanı bağlantısı kurulamadı: {e}")
     st.stop()
 
+with st.sidebar:
+    st.subheader("🔧 Ayar Durumu")
+    for k in ("DATABASE_URL", "GEMINI_API_KEY", "SMTP_EMAIL", "SMTP_PASSWORD"):
+        st.write(("✅ " if get_secret(k) else "❌ ") + k)
+    st.caption("❌ olanlar .env / secrets içinde bulunamadı. .env değişince Streamlit'i kapatıp yeniden başlatın.")
+
 compliance = ComplianceAgent()
 MIN_D, MAX_D = date(1950, 1, 1), date(2100, 12, 31)
 COLORS = {STATUS_ACTIVE: "#d4edda", STATUS_WARNING: "#fff3cd", STATUS_EXPIRED: "#f8d7da"}
@@ -55,10 +61,11 @@ with tab_up:
                              type=["pdf"], accept_multiple_files=True)
     if files and st.button("🤖 PDF Parser Ajanını Çalıştır", type="primary"):
         parser, found, empty = PDFParserAgent(), [], []
-        with st.spinner("Belgeler analiz ediliyor (taranmış PDF'lerde 10-30 sn sürebilir)..."):
-            for f in files:
-                res = parser.parse(f.getvalue(), f.name)
-                (found.extend(res) if res else empty.append(f.name))
+        bar = st.progress(0.0, text="Başlıyor...")
+        done = lambda i, n, name: bar.progress(i / n, text=f"{i}/{n} dosya işlendi · {name}")
+        for name, res in parser.parse_many([(f.getvalue(), f.name) for f in files], max_workers=3, on_done=done):
+            (found.extend(res) if res else empty.append(name))
+        bar.empty()
         st.session_state["parsed"], st.session_state["empty"] = found, empty
 
     for name in st.session_state.get("empty", []):
