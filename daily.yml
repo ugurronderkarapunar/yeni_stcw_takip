@@ -1,0 +1,22 @@
+# Streamlit Cloud uyku moduna gecince APScheduler durur; bu workflow ucretsiz yedek tetikleyicidir.
+# Spam korumasi DB flag'inde oldugu icin cift calisma guvenlidir.
+name: daily-stcw-check
+on:
+  schedule: [{ cron: "0 6 * * *" }]   # 06:00 UTC = 09:00 Istanbul
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r requirements.txt
+      - run: python scheduler.py --once
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          NOTIFY_DEFAULT_EMAIL: ${{ secrets.NOTIFY_DEFAULT_EMAIL }}
+          WHATSAPP_API_KEY: ${{ secrets.WHATSAPP_API_KEY }}
