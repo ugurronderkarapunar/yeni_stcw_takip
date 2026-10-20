@@ -9,6 +9,7 @@ import logging
 import re
 import smtplib
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -139,6 +140,9 @@ Rules:
 """
 
 
+_MODEL_CACHE: dict = {}  # api_key -> sirali model listesi (surec boyunca bir kez listelenir)
+
+
 class PDFParserAgent:
     def __init__(self):
         self.api_key = get_secret("GEMINI_API_KEY") or get_secret("GOOGLE_API_KEY")
@@ -146,7 +150,9 @@ class PDFParserAgent:
         self.last_model = None
 
     def _candidate_models(self, client) -> list[str]:
-        """Google'in o an sundugu Flash modellerini listeler (en yeni -> eski). Model adlari sik degistigi icin sabit yazilmaz."""
+        """Google'in o an sundugu Flash modellerini listeler (en yeni -> eski). Sonuc onbellege alinir."""
+        if _MODEL_CACHE.get(self.api_key):
+            return _MODEL_CACHE[self.api_key]
         found = []
         listed = False
         try:
@@ -164,7 +170,10 @@ class PDFParserAgent:
         if self.preferred and (not listed or self.preferred in names):
             order.append(self.preferred)
         order += names or ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
-        return list(dict.fromkeys(order))[:4]
+        result = list(dict.fromkeys(order))[:4]
+        if listed:
+            _MODEL_CACHE[self.api_key] = result
+        return result
 
     # ---------- yardimcilar ----------
     @staticmethod
@@ -215,19 +224,22 @@ class PDFParserAgent:
         prompt = _PROMPT + (f"\nText-layer hint:\n{text[:6000]}" if text else "")
         errors = []
         for model in self._candidate_models(client):
-            for attempt in range(2):
+            for attempt in range(3):
                 try:
                     resp = client.models.generate_content(
                         model=model, contents=parts + [prompt],
                         config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0))
                     raw = re.sub(r"^```(?:json)?|```$", "", (resp.text or "").strip(), flags=re.M).strip()
                     self.last_model = model
+                    cache = _MODEL_CACHE.get(self.api_key)
+                    if cache:  # calisan modeli one al: sonraki dosyalar hatali modelleri denemez
+                        _MODEL_CACHE[self.api_key] = [model] + [m for m in cache if m != model]
                     return json.loads(raw)
                 except Exception as e:
                     msg = str(e)
                     errors.append(f"{model}: {msg[:160]}")
-                    if attempt == 0 and any(c in msg for c in ("429", "500", "503", "UNAVAILABLE", "RESOURCE_EXHAUSTED")):
-                        time.sleep(5)
+                    if attempt < 2 and any(c in msg for c in ("429", "500", "503", "UNAVAILABLE", "RESOURCE_EXHAUSTED")):
+                        time.sleep(4 * (attempt + 1))
                         continue
                     break
         raise RuntimeError(" | ".join(errors[-3:]))
@@ -251,6 +263,22 @@ class PDFParserAgent:
             r.warnings.append("Bitiş tarihi veriliş tarihinden önce")
         r.needs_review = bool(r.warnings)
         return r
+
+    def parse_many(self, files: list[tuple[bytes, str]], max_workers: int = 3, on_done=None) -> list[tuple[str, list]]:
+        """Dosyalari paralel isler (Gemini bekleme suresi cakisir). Sonuc girdi sirasini korur."""
+        results: dict[int, list] = {}
+        with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(files) or 1))) as ex:
+            futs = {ex.submit(self.parse, data, name): i for i, (data, name) in enumerate(files)}
+            for n, fut in enumerate(as_completed(futs), 1):
+                i = futs[fut]
+                try:
+                    results[i] = fut.result()
+                except Exception as e:  # parse() zaten firlatmaz; ek guvence
+                    r = ParsedCertificate(source_file=files[i][1], needs_review=True, warnings=[f"Beklenmeyen hata: {e}"])
+                    results[i] = [r]
+                if on_done:
+                    on_done(n, len(files), files[i][1])
+        return [(files[i][1], results[i]) for i in range(len(files))]
 
     # ---------- ana akis ----------
     def parse(self, pdf_bytes: bytes, filename: str = "") -> list[ParsedCertificate]:
